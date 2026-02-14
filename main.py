@@ -8,7 +8,7 @@ import subprocess
 import imageio.v3 as iio  
 
 class MemeMatcher:
-    # --- 1. CONFIGURATION ---
+    
     EMOTION_KEYWORDS = {
         "smile": ["smile", "happy", "lol", "laugh", "grin", "joy", "fun"],
         "sad": ["sad", "cry", "tear", "upset", "depressed", "frown"],
@@ -139,7 +139,7 @@ class MemeMatcher:
         return frames
 
     def detect_facial_expression(self, landmarks, blendshapes):
-        # 1. Check for Tongue Out (using Blendshapes)
+        # 1. Check for Tongue Out 
         if blendshapes:
             for category in blendshapes:
                 if category.category_name == 'tongueOut':
@@ -199,20 +199,20 @@ class MemeMatcher:
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             self.frame_count += 1
             
-            # --- 1. Run AI Models ---
+            # Run AI Models 
             hand_result = self.gesture_recognizer.recognize_for_video(mp_image, self.frame_count)
             face_result = self.face_landmarker.detect_for_video(mp_image, self.frame_count)
             
             detected_tag = None
             
-            # --- 2. Check Gestures ---
+            # Check Gestures 
             if hand_result.gestures:
                 gesture_name = hand_result.gestures[0][0].category_name
                 if gesture_name in self.GESTURE_KEYWORDS:
                     detected_tag = gesture_name
                     self.current_state = f"Gesture: {gesture_name}"
 
-            # --- 3. Check Face ---
+            # Check Face 
             if not detected_tag and face_result.face_landmarks:
                 blendshapes = face_result.face_blendshapes[0] if face_result.face_blendshapes else None
                 emotion_name = self.detect_facial_expression(face_result.face_landmarks[0], blendshapes)
@@ -226,7 +226,7 @@ class MemeMatcher:
                  detected_tag = "neutral"
                  self.current_state = "Neutral"
 
-            # --- 4. Update Meme / GIF ---
+            # Update Meme / GIF 
             if detected_tag != self.last_tag:
                  self.last_tag = detected_tag
                  match = self.get_random_meme_by_tag(detected_tag)
@@ -238,7 +238,7 @@ class MemeMatcher:
                  else:
                      self.current_meme_frames = []
 
-            # --- 5. Render ---
+            # Then Render 
             h, w = frame.shape[:2]
             
             if self.current_meme_frames:

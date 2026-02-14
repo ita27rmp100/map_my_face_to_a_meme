@@ -24,7 +24,7 @@ Using a virtual environment keeps this project’s dependencies separate from yo
 
 1. Clone or download the project and go to its folder:
    ```bash
-   cd make_me_a_meme
+   cd map_my_face_to_a_meme
    ```
 
 2. Create and activate a virtual environment:
@@ -73,7 +73,7 @@ On first run, the script downloads two MediaPipe model files (~few MB) into the 
    - **Hand gestures**: thumbs up, thumbs down, peace sign, open palm, pointing up, fist, “I love you” sign.
    - **Facial expressions**: smile, sad, angry, surprised (open mouth), neutral, tongue out.
 4. When the app detects a gesture or expression, it shows a matching meme (if one exists for that tag) next to the video. The current state (e.g. `Gesture: Thumb_Up` or `Face: smile`) is shown on screen.
-5. Press **`q`** in the window to quit.
+5. Press **`CTRL + C`** in the window to quit.
 
 **Note:** Gestures are checked first. If no gesture is detected, face expression is used. So a clear hand gesture will override your face.
 
