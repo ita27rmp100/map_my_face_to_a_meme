@@ -2,311 +2,274 @@ import cv2
 import numpy as np
 import mediapipe as mp
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-import pickle
 import os
-
+import random
+import subprocess
+import imageio.v3 as iio  
 
 class MemeMatcher:
-    # MediaPipe landmark indices
-    LEFT_EYE_UPPER = [159, 145, 158]
-    LEFT_EYE_LOWER = [23, 27, 133]
-    RIGHT_EYE_UPPER = [386, 374, 385]
-    RIGHT_EYE_LOWER = [253, 257, 362]
-    LEFT_EYEBROW = [70, 63, 105, 66, 107]
-    RIGHT_EYEBROW = [300, 293, 334, 296, 336]
-    MOUTH_OUTER = [61, 291, 39, 181, 0, 17, 269, 405]
-    MOUTH_INNER = [78, 308, 95, 88]
-    NOSE_TIP = 4
+    # --- 1. CONFIGURATION ---
+    EMOTION_KEYWORDS = {
+        "smile": ["smile", "happy", "lol", "laugh", "grin", "joy", "fun"],
+        "sad": ["sad", "cry", "tear", "upset", "depressed", "frown"],
+        "angry": ["angry", "mad", "rage", "grumpy", "serious", "hate"],
+        "surprise": ["wow", "shock", "surprise", "omg", "pog", "open", "amazed", "scary"],
+        "neutral": ["neutral", "stare", "waiting", "bored"],
+        "Tongue_Out": ["tongue", "bleh", "silly", "crazy", "mlem", "lick"] 
+    }
+    
+    GESTURE_KEYWORDS = {
+        "Thumb_Up": ["thumbs_up", "like", "good", "approve", "cool"],
+        "Thumb_Down": ["thumbs_down", "dislike", "bad", "boo"],
+        "Victory": ["peace", "victory", "cool", "vibes"],
+        "Open_Palm": ["stop", "halt", "wait", "high_five"],
+        "Pointing_Up": ["point", "look", "up", "idea", "nerd"],
+        "Closed_Fist": ["fist", "punch", "strength", "power", "rock", "fight"],
+        "ILoveYou": ["love", "heart", "rock_on", "metal", "spider"]
+    }
 
-    CACHE_FILE = "meme_features_cache.pkl"
+    def __init__(self, assets_folder="assets"):
+        self.assets_folder = assets_folder
+        self.frame_count = 0
+        
+        self.hand_model_path = "gesture_recognizer.task"
+        self.face_model_path = "face_landmarker.task"
+        self._download_models()
 
-    def __init__(self, assets_folder="assets", frame_skip=2, meme_height=480):
-        self.last_features = None
-        self.frame_counter = 0
-        self.frame_skip = frame_skip
-        self.meme_height = meme_height
-
-        # Download or load models
-        self.face_model_path = self._download_model(
-            "face_landmarker.task",
-            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+        BaseOptions = mp.tasks.BaseOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
+        
+        # Initialize Hand Gesture Recognizer
+        GestureRecognizer = mp.tasks.vision.GestureRecognizer
+        GestureOptions = mp.tasks.vision.GestureRecognizerOptions
+        self.gesture_recognizer = GestureRecognizer.create_from_options(
+            GestureOptions(
+                base_options=BaseOptions(model_asset_path=self.hand_model_path),
+                running_mode=VisionRunningMode.VIDEO,
+                num_hands=2
+            )
         )
-        self.hand_model_path = self._download_model(
-            "hand_landmarker.task",
-            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-        )
 
-        # MediaPipe landmarkers
-        self.face_mesh_video = self._init_face_landmarker(video_mode=True)
-        self.hand_detector_video = self._init_hand_landmarker(video_mode=True)
-        self.face_mesh_image = self._init_face_landmarker(video_mode=False)
-        self.hand_detector_image = self._init_hand_landmarker(video_mode=False)
-
-        # Meme storage
-        self.memes = []
-        self.meme_features = []
-
-        # Feature vectors for similarity computation
-        self.feature_keys = [
-            'surprise_score', 'smile_score', 'concern_score', 'cheers_score',
-            'hand_raised', 'num_hands', 'eye_openness', 'eyes_symmetry',
-            'mouth_openness', 'mouth_width_ratio', 'mouth_elevation',
-            'eyebrow_height', 'brow_symmetry'
-        ]
-        self.feature_weights = np.array([25, 20, 20, 30, 25, 15, 20, 10, 25, 20, 15, 20, 10])
-        self.feature_factors = np.array([10, 10, 10, 10, 15, 15, 5, 5, 5, 5, 5, 5, 5])
-
-        # Load memes (with caching)
-        self.load_memes(assets_folder)
-
-    # ---------------- Model Initialization ----------------
-    def _download_model(self, model_path, url):
-        import subprocess
-        if not os.path.exists(model_path):
-            print(f"Downloading {model_path}...")
-            try:
-                subprocess.run(['curl', '-L', url, '-o', model_path], check=True, capture_output=True)
-                print(f"{model_path} downloaded successfully!")
-            except subprocess.CalledProcessError:
-                raise RuntimeError(f"Failed to download model. Please download manually from {url}")
-        return model_path
-
-    def _init_face_landmarker(self, video_mode=True):
-        mode = mp.tasks.vision.RunningMode.VIDEO if video_mode else mp.tasks.vision.RunningMode.IMAGE
-        return mp.tasks.vision.FaceLandmarker.create_from_options(
-            mp.tasks.vision.FaceLandmarkerOptions(
-                base_options=mp.tasks.BaseOptions(model_asset_path=self.face_model_path),
-                running_mode=mode,
+        # Initialize Face Landmarker with Blendshapes (for tongue)
+        FaceLandmarker = mp.tasks.vision.FaceLandmarker
+        FaceOptions = mp.tasks.vision.FaceLandmarkerOptions
+        self.face_landmarker = FaceLandmarker.create_from_options(
+            FaceOptions(
+                base_options=BaseOptions(model_asset_path=self.face_model_path),
+                running_mode=VisionRunningMode.VIDEO,
                 num_faces=1,
-                min_face_detection_confidence=0.5 if video_mode else 0.3,
-                min_face_presence_confidence=0.5 if video_mode else 0.3,
-                min_tracking_confidence=0.5 if video_mode else 0.0
+                min_face_detection_confidence=0.5,
+                min_face_presence_confidence=0.5,
+                min_tracking_confidence=0.5,
+                output_face_blendshapes=True
             )
         )
 
-    def _init_hand_landmarker(self, video_mode=True):
-        mode = mp.tasks.vision.RunningMode.VIDEO if video_mode else mp.tasks.vision.RunningMode.IMAGE
-        return mp.tasks.vision.HandLandmarker.create_from_options(
-            mp.tasks.vision.HandLandmarkerOptions(
-                base_options=mp.tasks.BaseOptions(model_asset_path=self.hand_model_path),
-                running_mode=mode,
-                num_hands=2,
-                min_hand_detection_confidence=0.3,
-                min_hand_presence_confidence=0.3,
-                min_tracking_confidence=0.3 if video_mode else 0.0
-            )
-        )
+        self.meme_db = self._load_meme_db()
+        self.current_meme_frames = [] # List of frames for GIF
+        self.current_meme_index = 0
+        self.current_state = "Waiting..."
+        self.last_tag = None
 
-    # ---------------- Meme Loading with Cache ----------------
-    def load_memes(self, folder):
-        cache_exists = os.path.exists(self.CACHE_FILE)
-        if cache_exists:
-            with open(self.CACHE_FILE, "rb") as f:
-                self.memes, self.meme_features = pickle.load(f)
-            print(f"Loaded {len(self.memes)} memes from cache.\n")
-            return
+    def _download_models(self):
+        tasks = [
+            (self.hand_model_path, "https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task"),
+            (self.face_model_path, "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task")
+        ]
+        for path, url in tasks:
+            if not os.path.exists(path):
+                print(f"Downloading {path}...")
+                subprocess.run(['curl', '-L', url, '-o', path], shell=True)
+                print("Done.")
 
-        assets_path = Path(folder)
-        image_files = list(assets_path.glob("*.jpg")) + list(assets_path.glob("*.png")) + list(assets_path.glob("*.jpeg"))
-        print(f"Found {len(image_files)} meme images. Extracting features...")
+    def _load_meme_db(self):
+        db = []
+        path = Path(self.assets_folder)
+        # Added .gif to the search list
+        files = list(path.glob("*.jpg")) + list(path.glob("*.png")) + list(path.glob("*.jpeg")) + list(path.glob("*.gif"))
+        
+        print(f"\nScanning {len(files)} images/gifs for keywords...")
+        for f in files:
+            name = f.stem.lower()
+            tags = []
+            for state, keywords in self.EMOTION_KEYWORDS.items():
+                if any(k in name for k in keywords) and len(tags) == 0:
+                    tags.append(state)
+            for state, keywords in self.GESTURE_KEYWORDS.items():
+                if any(k in name for k in keywords) and len(tags) == 0:
+                    tags.append(state)
 
-        def process_meme(img_file):
-            img = cv2.imread(str(img_file))
-            if img is None:
-                return None
-            h, w = img.shape[:2]
-            scale = self.meme_height / h
-            img_resized = cv2.resize(img, (int(w * scale), self.meme_height))
-            features = self.extract_face_features(img_resized, is_static=True)
-            if features is None:
-                print(f"Skipping {img_file.name}: No face detected")
-                return None
-            return {'image': img_resized, 'name': img_file.stem.replace('_', ' ').title(),
-                    'path': str(img_file)}, features
+            if tags:
+                db.append({"path": str(f), "tags": tags, "name": f.stem})
+                print(f"  [MATCH] {f.name} -> {tags}")
+            else:
+                db.append({"path": str(f), "tags": ["neutral"], "name": f.stem})
+                print(f"  [NEUTRAL] {f.name}")
+        
+        print(f"Database loaded. Total recognized memes: {len(db)}\n")
+        return db
 
-        with ThreadPoolExecutor() as executor:
-            results = list(executor.map(process_meme, sorted(image_files)))
+    def get_random_meme_by_tag(self, tag):
+        candidates = [m for m in self.meme_db if tag in m['tags']]
+        if candidates:
+            return random.choice(candidates)
+        return None
 
-        for r in results:
-            if r:
-                meme, features = r
-                self.memes.append(meme)
-                self.meme_features.append(features)
-                print(f"Loaded: {meme['name']}")
-
-        with open(self.CACHE_FILE, "wb") as f:
-            pickle.dump((self.memes, self.meme_features), f)
-        print(f"Total memes loaded: {len(self.memes)}\n")
-
-    # ---------------- Feature Extraction ----------------
-    def extract_face_features(self, image, is_static=False):
-        if is_static:
-            face_landmarker = self.face_mesh_image
-            hand_landmarker = self.hand_detector_image
+    def load_image_or_gif(self, path):
+        """Loads an image or GIF into a list of frames."""
+        frames = []
+        if path.lower().endswith(".gif"):
+            try:
+                # Load all frames from GIF using imageio
+                gif_frames = iio.imread(path, index=None)
+                for frame in gif_frames:
+                    # Convert RGB to BGR for OpenCV
+                    if frame.shape[-1] == 4: # Handle transparency
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+                    else:
+                        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    frames.append(frame)
+            except Exception as e:
+                print(f"Error loading GIF {path}: {e}")
         else:
-            face_landmarker = self.face_mesh_video
-            hand_landmarker = self.hand_detector_video
+            # Load standard image
+            img = cv2.imread(path)
+            if img is not None:
+                frames.append(img)
+        return frames
 
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    def detect_facial_expression(self, landmarks, blendshapes):
+        # 1. Check for Tongue Out (using Blendshapes)
+        if blendshapes:
+            for category in blendshapes:
+                if category.category_name == 'tongueOut':
+                    if category.score > 0.4: 
+                        return "Tongue_Out"
 
-        if is_static:
-            face_res = face_landmarker.detect(mp_image)
-            hand_res = hand_landmarker.detect(mp_image)
-        else:
-            self.frame_counter += 1
-            if self.frame_counter % self.frame_skip != 0:
-                return getattr(self, "last_features", None)
-            face_res = face_landmarker.detect_for_video(mp_image, self.frame_counter)
-            hand_res = hand_landmarker.detect_for_video(mp_image, self.frame_counter)
+        # 2. Geometric Checks
+        pts = np.array([[l.x, l.y] for l in landmarks])
+        
+        UPPER_LIP = 13
+        LOWER_LIP = 14
+        LEFT_LIP = 61
+        RIGHT_LIP = 291
+        LEFT_BROW = 105
+        RIGHT_BROW = 334
+        
+        mouth_open = np.linalg.norm(pts[UPPER_LIP] - pts[LOWER_LIP])
+        mouth_width = np.linalg.norm(pts[LEFT_LIP] - pts[RIGHT_LIP])
+        ratio = mouth_open / (mouth_width + 1e-6)
+        
+        if ratio > 0.5: return "surprise"
 
-        if not face_res.face_landmarks:
-            return None
+        lip_center_y = (pts[UPPER_LIP][1] + pts[LOWER_LIP][1]) / 2
+        left_corner_y = pts[LEFT_LIP][1]
+        right_corner_y = pts[RIGHT_LIP][1]
+        
+        if left_corner_y < lip_center_y - 0.01 and right_corner_y < lip_center_y - 0.01:
+             return "smile"
 
-        landmarks = face_res.face_landmarks[0]
-        landmark_array = np.array([[l.x, l.y] for l in landmarks])
-        features = self._compute_features(landmark_array, hand_res)
-        self.last_features = features
-        return features
+        if left_corner_y > lip_center_y + 0.01 and right_corner_y > lip_center_y + 0.01:
+            return "sad"
 
-    def _compute_features(self, landmark_array, hand_res):
-        # Eye aspect ratios
-        def ear(upper, lower):
-            vert = np.linalg.norm(landmark_array[upper] - landmark_array[lower], axis=1).mean()
-            horiz = np.linalg.norm(landmark_array[upper[0]] - landmark_array[upper[-1]])
-            return vert / (horiz + 1e-6)
+        brow_dist = np.linalg.norm(pts[LEFT_BROW] - pts[RIGHT_BROW])
+        face_width = np.linalg.norm(pts[127] - pts[356])
+        if (brow_dist / face_width) < 0.25: return "angry"
 
-        left_ear = ear(self.LEFT_EYE_UPPER, self.LEFT_EYE_LOWER)
-        right_ear = ear(self.RIGHT_EYE_UPPER, self.RIGHT_EYE_LOWER)
-        avg_ear = (left_ear + right_ear) / 2.0
+        return "neutral"
 
-        # Mouth
-        mouth_top, mouth_bottom = landmark_array[13], landmark_array[14]
-        mouth_height = np.linalg.norm(mouth_top - mouth_bottom)
-        mouth_left, mouth_right = landmark_array[61], landmark_array[291]
-        mouth_width = np.linalg.norm(mouth_left - mouth_right)
-        mouth_ar = mouth_height / (mouth_width + 1e-6)
-        inner_width = np.linalg.norm(landmark_array[78] - landmark_array[308])
-        mouth_width_ratio = inner_width / (mouth_width + 1e-6)
-
-        # Eyebrows
-        left_brow_y = landmark_array[self.LEFT_EYEBROW][:, 1].mean()
-        right_brow_y = landmark_array[self.RIGHT_EYEBROW][:, 1].mean()
-        left_eye_center = landmark_array[self.LEFT_EYE_UPPER + self.LEFT_EYE_LOWER][:, 1].mean()
-        right_eye_center = landmark_array[self.RIGHT_EYE_UPPER + self.RIGHT_EYE_LOWER][:, 1].mean()
-        left_brow_h = left_eye_center - left_brow_y
-        right_brow_h = right_eye_center - right_brow_y
-        avg_brow_h = (left_brow_h + right_brow_h) / 2.0
-
-        mouth_center_y = (mouth_left[1] + mouth_right[1]) / 2.0
-        nose_tip = landmark_array[self.NOSE_TIP]
-        mouth_elev = nose_tip[1] - mouth_center_y
-
-        # Hands
-        num_hands = len(hand_res.hand_landmarks) if hand_res.hand_landmarks else 0
-        hand_raised = 0.0
-        if num_hands > 0:
-            face_center = landmark_array[:, 1].mean()
-            face_top = landmark_array[:, 1].min()
-            wrist_y = np.array([h[0].y for h in hand_res.hand_landmarks])
-            middle_y = np.array([h[12].y for h in hand_res.hand_landmarks])
-            if np.any((middle_y < face_center + 0.2) | (wrist_y < face_top + 0.3)):
-                hand_raised = 1.0
-
-        # Features
-        return {
-            'eye_openness': avg_ear,
-            'left_eye_open': left_ear,
-            'right_eye_open': right_ear,
-            'eyes_symmetry': abs(left_ear - right_ear),
-            'mouth_openness': mouth_ar,
-            'mouth_width': mouth_width,
-            'mouth_width_ratio': mouth_width_ratio,
-            'mouth_elevation': mouth_elev,
-            'eyebrow_height': avg_brow_h,
-            'left_brow_height': left_brow_h,
-            'right_brow_height': right_brow_h,
-            'brow_symmetry': abs(left_brow_h - right_brow_h),
-            'num_hands': num_hands,
-            'hand_raised': hand_raised,
-            'surprise_score': avg_ear * avg_brow_h * mouth_ar,
-            'smile_score': mouth_width_ratio * (1.0 - mouth_ar),
-            'concern_score': avg_brow_h * (1.0 - mouth_elev),
-            'cheers_score': mouth_width_ratio * (1.0 - mouth_ar) * hand_raised
-        }
-
-    # ---------------- Vectorized Similarity ----------------
-    def compute_similarity(self, features1, features2):
-        if features1 is None or features2 is None:
-            return 0.0
-        vec1 = np.array([features1[k] for k in self.feature_keys])
-        vec2 = np.array([features2[k] for k in self.feature_keys])
-        diff = np.abs(vec1 - vec2)
-        similarity = np.exp(-diff * self.feature_factors)
-        return float(np.sum(self.feature_weights * similarity))
-
-    def find_best_match(self, user_features):
-        if user_features is None:
-            return None, 0.0
-        scores = np.array([self.compute_similarity(user_features, mf) for mf in self.meme_features])
-        if len(scores) == 0:
-            return None, 0.0
-        best_idx = int(np.argmax(scores))
-        return self.memes[best_idx], scores[best_idx]
-
-    # ---------------- Main Loop ----------------
     def run(self):
         cap = cv2.VideoCapture(0)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
+        cap.set(3, 640)
+        cap.set(4, 480)
+        
         if not cap.isOpened():
-            print("Error: Could not open camera")
+            print("Error: Camera not found.")
             return
 
-        print("\n🎥 Camera started! Press 'q' to quit\n")
-
+        print("--- Meme Matcher Started ---")
+        print("Press 'CTRL + C' to quit.")
+        
         while cap.isOpened():
             ret, frame = cap.read()
-            if not ret:
-                break
+            if not ret: break
+            
             frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            self.frame_count += 1
+            
+            # --- 1. Run AI Models ---
+            hand_result = self.gesture_recognizer.recognize_for_video(mp_image, self.frame_count)
+            face_result = self.face_landmarker.detect_for_video(mp_image, self.frame_count)
+            
+            detected_tag = None
+            
+            # --- 2. Check Gestures ---
+            if hand_result.gestures:
+                gesture_name = hand_result.gestures[0][0].category_name
+                if gesture_name in self.GESTURE_KEYWORDS:
+                    detected_tag = gesture_name
+                    self.current_state = f"Gesture: {gesture_name}"
 
-            user_features = self.extract_face_features(frame)
-            best_meme, score = self.find_best_match(user_features)
+            # --- 3. Check Face ---
+            if not detected_tag and face_result.face_landmarks:
+                blendshapes = face_result.face_blendshapes[0] if face_result.face_blendshapes else None
+                emotion_name = self.detect_facial_expression(face_result.face_landmarks[0], blendshapes)
+                if emotion_name != "neutral":
+                    detected_tag = emotion_name
+                    self.current_state = f"Face: {emotion_name}"
+                else:
+                    self.current_state = "Neutral"
+            
+            if not detected_tag:
+                 detected_tag = "neutral"
+                 self.current_state = "Neutral"
 
+            # --- 4. Update Meme / GIF ---
+            if detected_tag != self.last_tag:
+                 self.last_tag = detected_tag
+                 match = self.get_random_meme_by_tag(detected_tag)
+                 
+                 if match:
+                     # Load Frames (Supports GIF or static image)
+                     self.current_meme_frames = self.load_image_or_gif(match['path'])
+                     self.current_meme_index = 0
+                 else:
+                     self.current_meme_frames = []
+
+            # --- 5. Render ---
             h, w = frame.shape[:2]
-            if best_meme:
-                meme_img = best_meme['image']
-                meme_h, meme_w = meme_img.shape[:2]
-                scale = h / meme_h
-                new_w = int(meme_w * scale)
-                meme_resized = cv2.resize(meme_img, (new_w, h))
-
-                display = np.zeros((h, w + new_w, 3), dtype=np.uint8)
-                display[:, :w] = frame
-                display[:, w:w + new_w] = meme_resized
-
-                # Overlay text
-                cv2.rectangle(display, (5, 5), (200, 45), (0, 0, 0), -1)
-                cv2.putText(display, "YOU", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
-                cv2.rectangle(display, (w + 5, 5), (w + new_w - 5, 75), (0, 0, 0), -1)
-                cv2.putText(display, best_meme['name'], (w + 10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-                cv2.putText(display, f"Match: {score:.1f}", (w + 10, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            
+            if self.current_meme_frames:
+                # Cycle through frames for animation
+                # Slow down animation by updating only every 3rd frame of video
+                if self.frame_count % 3 == 0:
+                    self.current_meme_index = (self.current_meme_index + 1) % len(self.current_meme_frames)
+                
+                current_img = self.current_meme_frames[self.current_meme_index]
+                
+                # Resize and Attach
+                scale = h / current_img.shape[0]
+                resized_meme = cv2.resize(current_img, (int(current_img.shape[1]*scale), h))
+                
+                mw = resized_meme.shape[1]
+                combined = np.zeros((h, w + mw, 3), dtype=np.uint8)
+                combined[:, :w] = frame
+                combined[:, w:] = resized_meme
+                
+                cv2.putText(combined, self.current_state, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.imshow("Meme Matcher", combined)
             else:
-                display = frame
-                cv2.putText(display, "No face detected!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                cv2.putText(frame, "No image found!", (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                cv2.imshow("Meme Matcher", frame)
 
-            cv2.imshow("Meme Matcher - Press Q to quit", display)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            if cv2.waitKey(5) & 0xFF == ord('q'):
                 break
-
+                
         cap.release()
         cv2.destroyAllWindows()
 
-
 if __name__ == "__main__":
-    print("Meme Matcher Starting...\n")
-    matcher = MemeMatcher(assets_folder="assets")
-    matcher.run()
+    app = MemeMatcher(assets_folder="assets")
+    app.run()
