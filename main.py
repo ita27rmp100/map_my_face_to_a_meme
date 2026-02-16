@@ -25,7 +25,8 @@ class MemeMatcher:
         "Open_Palm": ["stop", "halt", "wait", "high_five"],
         "Pointing_Up": ["point", "look", "up", "idea", "nerd"],
         "Closed_Fist": ["fist", "punch", "strength", "power", "rock", "fight"],
-        "ILoveYou": ["love", "heart", "rock_on", "metal", "spider"]
+        "ILoveYou": ["love", "heart", "rock_on", "metal", "spider"],
+        "Raised_Hand": ["raised", "hand", "raise", "رفع", "يد", "wave", "hello", "hi"]
     }
 
     def __init__(self, assets_folder="assets"):
@@ -178,6 +179,33 @@ class MemeMatcher:
 
         return "neutral"
 
+    def detect_raised_hand(self, hand_result):
+        """
+        Detect if hand is raised (palm open with hand positioned high in frame).
+        This checks for Open_Palm gesture combined with hand position.
+        """
+        if not hand_result.gestures or not hand_result.hand_landmarks:
+            return False
+        
+        # Check if gesture is Open_Palm (which MediaPipe recognizes)
+        gesture_name = hand_result.gestures[0][0].category_name
+        if gesture_name != "Open_Palm":
+            return False
+        
+        # Check if hand is raised (wrist is higher than average finger position)
+        landmarks = hand_result.hand_landmarks[0]
+        wrist_y = landmarks[0].y
+        
+        # Average y position of fingertips
+        fingertips_y = (landmarks[4].y + landmarks[8].y + landmarks[12].y + 
+                       landmarks[16].y + landmarks[20].y) / 5
+        
+        # If wrist is significantly lower than fingertips, hand is raised
+        if wrist_y > fingertips_y + 0.15:
+            return True
+        
+        return False
+
     def run(self):
         cap = cv2.VideoCapture(0)
         cap.set(3, 640)
@@ -205,8 +233,12 @@ class MemeMatcher:
             
             detected_tag = None
             
-            # Check Gestures 
-            if hand_result.gestures:
+            # Check for Raised Hand first (priority gesture)
+            if self.detect_raised_hand(hand_result):
+                detected_tag = "Raised_Hand"
+                self.current_state = "Gesture: Raised Hand"
+            # Check Other Gestures 
+            elif hand_result.gestures:
                 gesture_name = hand_result.gestures[0][0].category_name
                 if gesture_name in self.GESTURE_KEYWORDS:
                     detected_tag = gesture_name
